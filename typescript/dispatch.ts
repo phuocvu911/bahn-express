@@ -15,6 +15,13 @@ import type { Action, ActionResult, DeskEvent, DeskEventKind, DeskSnapshot, Driv
 type Tune = {
   markup: number // quote = list price x markup (start value; it adapts during the week)
   feeMult: number // expected driver fee = typical fee x feeMult (x supply factor) at levels 7-8
+  staffingReserve: number // expected fee multiplier used to reject work that only pays if it books before the deadline raise
+  priceWarDiscount: number // temporary price multiplier after a level-8 price-war loss cluster
+  placeDayStep: number // learning step for the pickup and delivery place price signal within one day
+  snowReserve: number // staffing-cost multiplier where a forecast overlaps the order's remaining window
+  outagePremium: number // temporary price premium for a place with a strong weekday win cluster
+  distanceDayStep: number // learning step for short / medium / long route price room within one day
+  dealerStep: number // bounded dealer-specific price learning from quoted decisions
   minMargin: number // decline when (price - expected fee) / price is below this
   cap: number // decline when this many orders due for pickup within `horizon` hours have no driver
   horizon: number
@@ -45,6 +52,13 @@ function defaultTune(level: number): Tune {
   return {
     markup: level <= 3 ? 1 : level === 8 ? 1.35 : level === 7 ? 1.22 : 1.0,
     feeMult: shortage ? 1.25 : 1.1,
+    staffingReserve: shortage ? 1.6 : 1,
+    priceWarDiscount: level === 8 ? 0.82 : 1,
+    placeDayStep: shortage ? 0.04 : 0,
+    snowReserve: 1,
+    outagePremium: shortage ? 0.1 : 0,
+    distanceDayStep: 0,
+    dealerStep: 0,
     minMargin: shortage ? 0.15 : 0.1,
     cap: shortage ? 22 : 40,
     horizon: 12,
@@ -62,7 +76,7 @@ function defaultTune(level: number): Tune {
     // accepts by 1%, up to 25%. Desk already tracks that history as it delivers.
     trust: level === 8 ? 0.01 : 0,
     stepMin: 30,
-    chain: 0,
+    chain: shortage ? 0.9 : 0,
     laneStep: 0,
     laneTable: 0,
     feeTable: 0,
@@ -126,6 +140,14 @@ const WAKE_ON: DeskEventKind[] = ["price_request", "order_won", "order_changed",
 type Retry = { pickupFrom: number; manualLicence: boolean; plates: boolean }
 const FIRST_TRY: Retry = { pickupFrom: 0, manualLicence: false, plates: false }
 
+/** Requirements that are expensive to discover only after the first driver arrives. */
+function initialRequirements(note: Note | null): Retry {
+  const text = note?.text.toLowerCase() ?? ""
+  const manualLicence = /manuaal|\bmanual\b|manuell/.test(text)
+  const plates = /(?:ei|ilman|utan|without|no|saknar|saknas|missing)[^.\n]{0,24}(?:kilv|rekister|plate|skylt)|(?:kilv|plates?|skylt)[^.\n]{0,16}(?:puuttuu|missing|saknas)|siirtokilv|kilve?tön|unregistered/.test(text)
+  return { pickupFrom: 0, manualLicence, plates }
+}
+
 /** What the starter remembers, and its answer to each event. The answers wait in the outbox
  * until the starter sends them, and the world applies them at the current minute. */
 class Desk {
@@ -159,10 +181,19 @@ class Desk {
   readonly chained = new Set<string>() // gigs that got chain offers
   chainOffers = 0
   chainAccepted = 0
+  lateDriverReleases = 0
   readonly lane = new Map<string, number>() // price category -> learned multiplier
+  readonly placeDay = new Map<string, number>() // day x place price multiplier, learned from won and lost quotes
+  readonly outageVotes = new Map<string, { won: number; total: number }>() // day x place weekday decisions
+  readonly outagePlaces = new Set<string>() // day x place where the competitor likely has an outage
+  readonly distanceDay = new Map<string, number>() // day x distance bucket price multiplier
   readonly quotedLanes = new Map<string, Map<string, string>>() // request id -> option -> category
   readonly dealerTrust = new Map<string, number>() // dealer id -> our on-time count with it (level 8: max 25, halved by a late order)
+  readonly dealerPrice = new Map<string, number>() // dealer-specific price room, corrected by wins and losses
   pairsBooked = 0 // pair gigs that a driver booked
+  readonly decisions: { day: number; won: boolean }[] = [] // recent quoted decisions for level-8 price-war detection
+  priceWarDay: number | null = null
+  readonly snow: { from: number; to: number; places: Set<string> }[] = []
 
   constructor(world: World, level: number, now: number, market: Market, tune: Tune) {
     this.world = world
@@ -185,6 +216,28 @@ class Desk {
     const s = this.supply(leg.pickup.placeId) + 0.5 * this.supply(leg.delivery.placeId)
     const factor = clamp(Math.sqrt(1.5 / Math.max(0.05, s)), 0.85, 1.8)
     return request.referenceFeeCents * this.tune.feeMult * factor * this.feeFactor(leg.pickup.placeId, leg.delivery.placeId)
+  }
+
+  recordForecast(event: Extract<DeskEvent, { kind: "forecast" }>): void {
+    this.snow.push({ from: event.from, to: event.to, places: new Set(event.placeIds) })
+  }
+
+  /** Snow slows a trip and makes some drivers drop their bookings. Hold a larger staffing reserve
+   * when its window overlaps the remaining work at either end of the route. */
+  snowFactor(request: PriceRequest, deadline: number): number {
+    if (this.tune.snowReserve <= 1) return 1
+    const places = new Set(request.legs.flatMap((leg) => [leg.pickup.placeId, leg.delivery.placeId]))
+    return this.snow.some((snow) => snow.to >= this.now && snow.from <= deadline && [...places].some((place) => snow.places.has(place))) ? this.tune.snowReserve : 1
+  }
+
+  /** A quote must still leave its minimum margin after a likely deadline-close raise.
+   * The reserve rises from 1 at 12 hours of slack to its maximum at `minSlack`.
+   * The absolute top urgent fee is intentionally uncapped against price, so using it
+   * directly would reject every job. */
+  worstCaseStaffingCost(request: PriceRequest, deadline: number): number {
+    const span = 5 * HOUR
+    const risk = clamp((((this.tune.minSlack * HOUR + span) - this.slack(request, deadline)) / span), 0, 1)
+    return this.expectedFee(request) * (1 + (this.tune.staffingReserve - 1) * risk)
   }
 
   /** Minutes from the dealer's decision to the last pickup that still delivers every car by
@@ -238,7 +291,7 @@ class Desk {
       }
     }
     for (const gig of snapshot.gigs) if (gig.status === "open" && new Set(gig.stops.map((stop) => stop.orderId)).size > 1) this.pairs.set(gig.id, gig.postedAt)
-    for (const event of history) if (event.kind === "gig_viewed" || event.kind === "ledger") await this.handle(event)
+    for (const event of history) if (event.kind === "gig_viewed" || event.kind === "ledger" || event.kind === "forecast") await this.handle(event)
     for (const request of snapshot.openRequests) this.quote(request)
   }
 
@@ -246,12 +299,14 @@ class Desk {
     if (event.kind === "price_request") this.quote(event.request)
     else if (event.kind === "order_won") await this.win(event.order)
     else if (event.kind === "order_changed") await this.change(event.order)
+    else if (event.kind === "forecast") this.recordForecast(event)
     // The world has stopped a cancelled order's car and told each of its gigs what happens.
     else if (event.kind === "order_cancelled") {
       for (const books of [this.orders, this.legGigs]) books.delete(event.orderId)
       for (const gig of event.gigs) if (gig.outcome === "withdrawn" && this.pairs.has(gig.gigId)) this.unpair(gig.gigId, true)
     }
     else if (event.kind === "visit_failed") await this.retry(event.orderId, event.leg, event.reason)
+    else if (event.kind === "driver_late") await this.replaceLateDriver(event.gigId, event.pickupAt)
     else if (event.kind === "gig_expired") this.repost(event.gigId)
     // It comes again when a driver drops the car after the first warning.
     else if (event.kind === "deadline_close") await this.raise(event.orderId)
@@ -277,6 +332,11 @@ class Desk {
    * Losses move it more, so the desk settles near a win rate of about one in three. */
   learn(requestId: string, won: boolean, option: string | null): void {
     if (this.level <= 3 || !this.quoted.delete(requestId)) return
+    this.detectPriceWar(won)
+    this.learnPlaceDay(requestId, won)
+    this.detectOutage(requestId, won)
+    this.learnDistanceDay(requestId, won)
+    this.learnDealer(requestId, won)
     // Per category: the option won moves up; on a loss every quoted option moves down.
     const lanes = this.quotedLanes.get(requestId)
     this.quotedLanes.delete(requestId)
@@ -288,6 +348,80 @@ class Desk {
     }
     const lo = Math.max(1, this.tune.markup - 0.2)
     this.markup = clamp(this.markup + (won ? 0.015 * (1 - this.tune.winTarget) : -0.015 * this.tune.winTarget), lo, this.tune.markup + this.tune.markupRange)
+  }
+
+  /** Level 8 has one weekday where the competitor cuts prices by 20%. A persistent loss
+   * cluster during the day is stronger evidence than one bad lane, so cut only for that day. */
+  detectPriceWar(won: boolean): void {
+    if (this.level !== 8 || this.priceWarDay !== null) return
+    const day = Math.floor(this.now / DAY)
+    const minute = this.now % DAY
+    if (day > 4 || minute < 8 * HOUR || minute >= 18 * HOUR) return
+    this.decisions.push({ day, won })
+    while (this.decisions.length > 20 || this.decisions[0]?.day !== day) this.decisions.shift()
+    if (this.decisions.length < 12) return
+    const wins = this.decisions.filter((decision) => decision.won).length
+    if (wins / this.decisions.length <= 0.1) this.priceWarDay = day
+  }
+
+  /** Dealers differ in price sensitivity, and the competitor responds to our history with each one.
+   * Keep a small, bounded correction per dealer so repeated wins probe upward while later losses
+   * pull bids back without disturbing profitable dealers elsewhere. */
+  learnDealer(requestId: string, won: boolean): void {
+    if (this.tune.dealerStep <= 0) return
+    const request = this.requests.get(requestId)
+    if (!request) return
+    const delta = (won ? 1 - this.tune.winTarget : -this.tune.winTarget) * this.tune.dealerStep
+    this.dealerPrice.set(request.dealerId, clamp((this.dealerPrice.get(request.dealerId) ?? 1) + delta, 0.92, 1.08))
+  }
+
+  /** The level 8 outage makes the competitor's regional backup about 30% dearer from
+   * 08:00 to 18:00. A strongly winning place is an actionable local signal; use a
+   * smaller premium because a short burst can still be ordinary quote noise. */
+  detectOutage(requestId: string, won: boolean): void {
+    if (this.level < 6 || this.tune.outagePremium <= 0) return
+    const request = this.requests.get(requestId)
+    if (!request) return
+    const day = Math.floor(request.arrivedAt / DAY)
+    const minute = request.arrivedAt % DAY
+    if (day > 4 || minute < 8 * HOUR || minute >= 18 * HOUR) return
+    const leg = request.legs[0]!
+    for (const place of new Set([leg.pickup.placeId, leg.delivery.placeId])) {
+      const key = `${day}:${place}`
+      const votes = this.outageVotes.get(key) ?? { won: 0, total: 0 }
+      votes.total++
+      if (won) votes.won++
+      this.outageVotes.set(key, votes)
+      if (votes.total >= 8 && votes.won / votes.total >= 0.75) this.outagePlaces.add(key)
+    }
+  }
+
+  /** A long route's real cost depends on whether its pickup and destination have work that day.
+   * Learn price room separately for both places, with a bounded adjustment because a single
+   * decision is noisy. The day in the key resets the signal every morning. */
+  learnPlaceDay(requestId: string, won: boolean): void {
+    if (this.tune.placeDayStep <= 0) return
+    const request = this.requests.get(requestId)
+    if (!request) return
+    const day = Math.floor(request.arrivedAt / DAY)
+    const leg = request.legs[0]!
+    const places = [...new Set([leg.pickup.placeId, leg.delivery.placeId])]
+    const delta = (won ? 1 - this.tune.winTarget : -this.tune.winTarget) * this.tune.placeDayStep / places.length
+    for (const place of places) {
+      const key = `${day}:${place}`
+      this.placeDay.set(key, clamp((this.placeDay.get(key) ?? 1) + delta, 0.82, 1.25))
+    }
+  }
+
+  /** The competitor changes its short and long lane prices in opposite directions once a week.
+   * Keep a separate bounded signal for each distance bucket, reset every day. */
+  learnDistanceDay(requestId: string, won: boolean): void {
+    if (this.tune.distanceDayStep <= 0) return
+    const request = this.requests.get(requestId)
+    if (!request) return
+    const key = `${Math.floor(request.arrivedAt / DAY)}:${this.distanceBucket(request)}`
+    const delta = (won ? 1 - this.tune.winTarget : -this.tune.winTarget) * this.tune.distanceDayStep
+    this.distanceDay.set(key, clamp((this.distanceDay.get(key) ?? 1) + delta, 0.82, 1.25))
   }
 
   delivered(orderId: string, leg: number, at: number): void {
@@ -336,9 +470,14 @@ class Desk {
         const pairs = this.pairsWith(request, option)
         const trust = 1 + this.tune.trust * (this.dealerTrust.get(request.dealerId) ?? 0)
         const laneKey = this.laneOf(request, option.kind)
-        const lane = (this.lane.get(laneKey) ?? 1) * this.laneFactor(request, option.kind)
-        const price = Math.round((option.listPriceCents * this.markup * slow * trust * lane * (pairs ? this.tune.pairPrice : 1)) / 100) * 100
-        const cost = pairs ? request.referenceFeeCents * this.tune.open * this.tune.pairOpen * 1.2 : fee
+        const dealer = this.dealerPrice.get(request.dealerId) ?? 1
+        const lane = (this.lane.get(laneKey) ?? 1) * this.laneFactor(request, option.kind) * this.placeDayFactor(request) * this.distanceDayFactor(request) * this.outageFactor(request) * dealer
+        const war = this.priceWarDay === Math.floor(this.now / DAY) ? this.tune.priceWarDiscount : 1
+        const price = Math.round((option.listPriceCents * this.markup * slow * trust * lane * war * (pairs ? this.tune.pairPrice : 1)) / 100) * 100
+        const openingCost = pairs ? request.referenceFeeCents * this.tune.open * this.tune.pairOpen * 1.2 : fee
+        // Pairing lowers the opening fee, but an unbooked pair is split at its deadline.
+        // Reserve for the resulting individual gig as well.
+        const cost = Math.max(openingCost, this.worstCaseStaffingCost(request, option.deadline)) * this.snowFactor(request, option.deadline)
         if (price - cost >= this.tune.minMargin * price) {
           prices[option.kind] = price
           this.quotedLanes.set(request.id, (this.quotedLanes.get(request.id) ?? new Map()).set(option.kind, laneKey))
@@ -383,7 +522,8 @@ class Desk {
     }
     if (!best) return false
     const { gigId, stops, other } = best
-    const audience = { experienced: [order, other].some((o) => o.legs[0]!.car.premium), manualLicence: false }
+    const manualLicence = [order, other].some((o) => initialRequirements(this.requests.get(o.id)?.note ?? null).manualLicence)
+    const audience = { experienced: [order, other].some((o) => o.legs[0]!.car.premium), manualLicence }
     this.legGigs.delete(other.id)
     this.outbox.push({ type: "withdraw", gigId })
     this.outbox.push({ type: "post", stops, audience, schedule: this.feesForStops(stops) })
@@ -411,6 +551,32 @@ class Desk {
     const leg = request.legs[0]!
     const v = (LANES.pickup[leg.pickup.placeId] ?? 0) + (LANES.delivery[leg.delivery.placeId] ?? 0) + this.tune.laneOption * (LANES.option[kind] ?? 0)
     return clamp(Math.exp(this.tune.laneTable * v), 0.75, 1.4)
+  }
+
+  placeDayFactor(request: PriceRequest): number {
+    if (this.tune.placeDayStep <= 0) return 1
+    const day = Math.floor(request.arrivedAt / DAY)
+    const leg = request.legs[0]!
+    const pickup = this.placeDay.get(`${day}:${leg.pickup.placeId}`) ?? 1
+    const delivery = this.placeDay.get(`${day}:${leg.delivery.placeId}`) ?? 1
+    return Math.sqrt(pickup * delivery)
+  }
+
+  outageFactor(request: PriceRequest): number {
+    if (this.tune.outagePremium <= 0) return 1
+    const day = Math.floor(request.arrivedAt / DAY)
+    const leg = request.legs[0]!
+    return this.outagePlaces.has(`${day}:${leg.pickup.placeId}`) || this.outagePlaces.has(`${day}:${leg.delivery.placeId}`) ? 1 + this.tune.outagePremium : 1
+  }
+
+  distanceBucket(request: PriceRequest): 0 | 1 | 2 {
+    const minutes = Math.max(...request.legs.map((leg) => this.market.minutes.get(`${leg.pickup.placeId}>${leg.delivery.placeId}`) ?? 0))
+    return minutes <= 120 ? 0 : minutes <= 240 ? 1 : 2
+  }
+
+  distanceDayFactor(request: PriceRequest): number {
+    if (this.tune.distanceDayStep <= 0) return 1
+    return this.distanceDay.get(`${Math.floor(request.arrivedAt / DAY)}:${this.distanceBucket(request)}`) ?? 1
   }
 
   /** The price category of an option: how many drivers live near the delivery (the competitor
@@ -455,8 +621,8 @@ class Desk {
       const d1 = minutes(lx.pickup.placeId, lx.delivery.placeId)
       const d2 = minutes(ly.pickup.placeId, ly.delivery.placeId)
       if (transfer > this.tune.pairTransfer || d1 + transfer + d2 > 11 * HOUR) continue
-      const sx = withoutWindows(stopsFor(x, [0], this.requests.get(x.id)!.note, FIRST_TRY), this.now)
-      const sy = withoutWindows(stopsFor(y, [0], this.requests.get(y.id)!.note, FIRST_TRY), this.now)
+      const sx = withoutWindows(stopsFor(x, [0], this.requests.get(x.id)!.note, initialRequirements(this.requests.get(x.id)!.note)), this.now)
+      const sy = withoutWindows(stopsFor(y, [0], this.requests.get(y.id)!.note, initialRequirements(this.requests.get(y.id)!.note)), this.now)
       const pickX = sx[0]!.window ?? lx.pickup.window
       const pickY = sy[0]!.window ?? ly.pickup.window
       const t0 = Math.max(this.now + 90, pickX.from) // a driver needs time to find and reach the gig
@@ -652,15 +818,51 @@ class Desk {
     await this.post(order, [leg], { pickupFrom, manualLicence: reason === "licence", plates: reason === "no_plates" })
   }
 
+  /** A driver_late notice permits a free release. Replace the driver only when their new
+   * pickup time makes one of the gig's deliveries miss its deadline; a late pickup alone
+   * can still produce an on-time delivery and is worth keeping. */
+  async replaceLateDriver(gigId: string, pickupAt: number): Promise<void> {
+    const action = this.posts.get(gigId)
+    if (!action || !this.booked.has(gigId)) return
+    let at = pickupAt
+    let previous: string | undefined
+    let missesDeadline = false
+    for (const stop of action.stops) {
+      const leg = this.orders.get(stop.orderId)?.legs[stop.leg]
+      if (!leg) return
+      const place = stop.kind === "pickup" ? leg.pickup.placeId : leg.delivery.placeId
+      if (previous) at += this.market.minutes.get(`${previous}>${place}`) ?? Infinity
+      previous = place
+      if (stop.kind === "delivery" && at > this.orders.get(stop.orderId)!.deadline) missesDeadline = true
+    }
+    if (!missesDeadline) return
+    this.outbox.push({ type: "release", gigId })
+    await this.send()
+    this.booked.delete(gigId)
+    this.posts.delete(gigId)
+    for (const { orderId, leg } of action.stops) if (this.legGigs.get(orderId)?.get(leg) === gigId) this.legGigs.get(orderId)!.delete(leg)
+    for (const orderId of new Set(action.stops.map((stop) => stop.orderId))) {
+      const order = this.orders.get(orderId)
+      if (order && order.deliveredAt.some((deliveredAt) => deliveredAt === null)) await this.post(order, undelivered(order))
+    }
+    this.lateDriverReleases++
+  }
+
   async post(order: Order, legs: number[], retry = FIRST_TRY): Promise<void> {
+    const requirements = initialRequirements(this.requests.get(order.id)!.note)
+    const initial = {
+      pickupFrom: retry.pickupFrom,
+      manualLicence: retry.manualLicence || requirements.manualLicence,
+      plates: retry.plates || requirements.plates,
+    }
     // A premium car needs an experienced driver: the fine is €150 a car.
-    const audience = { experienced: order.legs.some((leg) => leg.car.premium), manualLicence: retry.manualLicence }
-    const stops = withoutWindows(stopsFor(order, legs, this.requests.get(order.id)!.note, retry), this.now)
+    const audience = { experienced: order.legs.some((leg) => leg.car.premium), manualLicence: initial.manualLicence }
+    const stops = withoutWindows(stopsFor(order, legs, this.requests.get(order.id)!.note, initial), this.now)
     this.outbox.push({ type: "post", stops, audience, schedule: this.feesFor(order, legs.length) })
     if (legs.length === 1) return
     // A trade-in over the 12-hour limit for a gig with two cars goes as one gig per car.
     await this.send()
-    if (this.gigsOf(order.id).length === 0) for (const leg of legs) await this.post(order, [leg], retry)
+    if (this.gigsOf(order.id).length === 0) for (const leg of legs) await this.post(order, [leg], initial)
   }
 
   /** The gigs that carry the order's undelivered legs: one, or one for each leg of a split trade-in. */
@@ -843,7 +1045,7 @@ async function playPractice(world: World, level: number, tune: Tune, quiet = fal
       }
     }
   }
-  return `${world.id} markup ${desk.markup.toFixed(2)} quoted ${desk.taken} declined ${desk.declined} ${JSON.stringify(desk.why)} pairs ${desk.paired}/${desk.pairsBooked} booked, pair quotes ${desk.pairQuotes}, chain ${desk.chainOffers}/${desk.chainAccepted}`
+  return `${world.id} markup ${desk.markup.toFixed(2)} quoted ${desk.taken} declined ${desk.declined} ${JSON.stringify(desk.why)} pairs ${desk.paired}/${desk.pairsBooked} booked, pair quotes ${desk.pairQuotes}, price war ${desk.priceWarDay ?? "none"}, late-driver releases ${desk.lateDriverReleases}, chain ${desk.chainOffers}/${desk.chainAccepted}`
 }
 
 /** Rebuilds the books, then answers events as they come. After a second without an event,
@@ -944,6 +1146,13 @@ async function main(): Promise<void> {
       final: { type: "boolean" },
       markup: { type: "string" },
       "fee-mult": { type: "string" },
+      "staffing-reserve": { type: "string" },
+      "price-war-discount": { type: "string" },
+      "place-day-step": { type: "string" },
+      "snow-reserve": { type: "string" },
+      "outage-premium": { type: "string" },
+      "distance-day-step": { type: "string" },
+      "dealer-step": { type: "string" },
       "min-margin": { type: "string" },
       cap: { type: "string" },
       "bulk-cap": { type: "string" },
@@ -976,6 +1185,13 @@ async function main(): Promise<void> {
     ...base,
     markup: num(args.markup, base.markup),
     feeMult: num(args["fee-mult"], base.feeMult),
+    staffingReserve: num(args["staffing-reserve"], base.staffingReserve),
+    priceWarDiscount: num(args["price-war-discount"], base.priceWarDiscount),
+    placeDayStep: num(args["place-day-step"], base.placeDayStep),
+    snowReserve: num(args["snow-reserve"], base.snowReserve),
+    outagePremium: num(args["outage-premium"], base.outagePremium),
+    distanceDayStep: num(args["distance-day-step"], base.distanceDayStep),
+    dealerStep: num(args["dealer-step"], base.dealerStep),
     minMargin: num(args["min-margin"], base.minMargin),
     cap: num(args.cap, base.cap),
     bulkCap: num(args["bulk-cap"], base.bulkCap),

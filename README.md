@@ -42,16 +42,16 @@ Node 22.18+ works too: `node dispatch.ts ...`. The run viewer is at `$SPREAD_URL
 | `--markup-range` | 0.8 | How far above its start the markup may adapt. |
 | `--win-target` | 0.33 | Share of real quotes the markup aims to win (0.25–0.45 all scored about the same). |
 | `--fee-mult` | 1.25 | Expected driver fee = typical fee × this × supply factor (few drivers near pickup → dearer). |
-| `--min-margin` | 0.2 | Decline when (price − expected fee) / price is below this. |
+| `--min-margin` | 0.15 | Decline when (price − expected fee) / price is below this. |
 | `--open` | 0.85 | Opening driver fee = typical fee × this; it rises +0.1 every 30 min (+0.6 max). Steep after a deadline warning. |
-| `--min-slack` | 9 | Hours from the dealer's decision to the last pickup an option must leave; tighter options aren't quoted. |
+| `--min-slack` | 7 | Hours from the dealer's decision to the last pickup an option must leave; tighter options aren't quoted. |
 | `--trade-ins`, `--privates` | no | Quote trade-ins / private addresses (48% / 20% were late in practice). Pass `yes` to allow. |
 | `--pair` | yes (L3+) | Return-trip pairing: a new single-car order joins an open single-car gig when one car's delivery is ≤ `--pair-transfer` road minutes (30) from the other's pickup and both deadlines still fit. |
 | `--pair-open` | 0.8 | A pair gig opens at (sum of both typical fees) × `--open` × this. |
 | `--pair-wait` | 2 | Hours an unbooked pair gig waits before it is split back into two gigs (also split on a deadline warning, change or cancellation). |
 | `--pair-price` | 0.92 | Quote multiplier for a request that would pair with one of our open gigs (win more cheap-to-move cars). |
-| `--cap` | 14 | Decline while this many orders due for pickup in 12 h have no driver. |
-| `--bulk-cap` | 6 | Most cars quoted from one bulk batch. |
+| `--cap` | 22 | Decline while this many orders due for pickup in 12 h have no driver. |
+| `--bulk-cap` | 10 | Most cars quoted from one bulk batch. |
 
 Analysis helpers (in `analysis/`): `bun ../analysis/reveal.ts <worldId>` (win rates by price, fees paid), `bun ../analysis/late.ts <ids…>` (which orders were late), `../analysis/ab.sh <level> <seeds> "<flags A>" "<flags B>"` (A/B test).
 

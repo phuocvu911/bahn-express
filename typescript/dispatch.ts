@@ -6,6 +6,7 @@
  *  - direct offers to drivers who already viewed an order's gigs when its deadline warning comes,
  *  - a --seeds option to play several practice worlds in parallel for comparing settings.
  * Run: `bun dispatch.ts --level 8 --seed spread-1`. See README.md in the project root. */
+import { existsSync, readFileSync } from "node:fs"
 import { parseArgs } from "node:util"
 import { Client, SpreadError, Unreachable, World } from "./spread.ts"
 import type { Action, ActionResult, DeskEvent, DeskEventKind, DeskSnapshot, DriverProfile, FeeStep, Note, Order, PostAction, PriceRequest, Score, StopRef, TimeWindow } from "./spread.ts"
@@ -26,6 +27,9 @@ type Tune = {
   pairTransfer: number // max road minutes from the first car's delivery to the second car's pickup
   pairOpen: number // a pair gig opens at (sum of both typical fees) x open x pairOpen
   pairWait: number // hours an unbooked pair gig waits before it is split into two gigs
+  laneOption: number // weight of the lane table's option part (same-day / next-day / 3-day)
+  feeTable: number // weight of the fee table in expected and opening fees (0 = off)
+  laneTable: number // weight of the lane table in quotes (0 = off, 1 = as fitted)
   laneStep: number // learning step of the per-category price adjustment (delivery-place drivers x option); 0 = off
   chain: number // direct-offer fee for a driver who finishes one of our gigs near the pickup, x the opening fee (0 = off)
   chainReach: number // max road minutes from where that driver finishes to the pickup
@@ -41,28 +45,44 @@ function defaultTune(level: number): Tune {
   return {
     markup: level <= 3 ? 1 : level === 8 ? 1.35 : level === 7 ? 1.22 : 1.0,
     feeMult: shortage ? 1.25 : 1.1,
-    minMargin: shortage ? 0.2 : 0.1,
-    cap: shortage ? 14 : 40,
+    minMargin: shortage ? 0.15 : 0.1,
+    cap: shortage ? 22 : 40,
     horizon: 12,
-    bulkCap: shortage ? 6 : 15,
+    bulkCap: shortage ? 10 : 15,
     markupRange: shortage ? 0.8 : 0.4,
     open: shortage ? 0.85 : 1.2,
-    minSlack: shortage ? 9 : 3,
+    minSlack: shortage ? 7 : 3,
     winTarget: 1 / 3,
     pair: level >= 3,
     pairTransfer: 30,
     pairOpen: 0.8,
     pairWait: 2,
     pairPrice: 0.92,
-    trust: 0,
+    // At level 8, each on-time delivery to a dealer raises the price that dealer
+    // accepts by 1%, up to 25%. Desk already tracks that history as it delivers.
+    trust: level === 8 ? 0.01 : 0,
     stepMin: 30,
     chain: 0,
     laneStep: 0,
+    laneTable: 0,
+    feeTable: 0,
+    laneOption: 1,
     chainReach: 45,
     tradeIns: !shortage,
     privates: !shortage,
   }
 }
+
+/** The lane table (lanes.json, from analysis/fit.ts over ~900 practice weeks): how much more or less
+ * than average dealers accept on each pickup place, delivery place and option, in log-price units.
+ * It is the part of the competitor's price that holds in every world. */
+type LaneTable = { pickup: Record<string, number>; delivery: Record<string, number>; option: Record<string, number> }
+const LANES_FILE = new URL("./lanes.json", import.meta.url).pathname
+const LANES: LaneTable | null = existsSync(LANES_FILE) ? JSON.parse(readFileSync(LANES_FILE, "utf8")) : null
+/** The fee table (fees.json, from analysis/fit-fees.ts over ~250k gigs): how much more or less than the
+ * typical fee drivers book at, by pickup and delivery place, in log units. */
+const FEES_FILE = new URL("./fees.json", import.meta.url).pathname
+const FEES: { pickup: Record<string, number>; delivery: Record<string, number> } | null = existsSync(FEES_FILE) ? JSON.parse(readFileSync(FEES_FILE, "utf8")) : null
 
 /** Where drivers live: for each place, the drivers whose home is within 30 km in a straight line
  * (the app's notification radius). */
@@ -164,7 +184,7 @@ class Desk {
     const leg = request.legs[0]!
     const s = this.supply(leg.pickup.placeId) + 0.5 * this.supply(leg.delivery.placeId)
     const factor = clamp(Math.sqrt(1.5 / Math.max(0.05, s)), 0.85, 1.8)
-    return request.referenceFeeCents * this.tune.feeMult * factor
+    return request.referenceFeeCents * this.tune.feeMult * factor * this.feeFactor(leg.pickup.placeId, leg.delivery.placeId)
   }
 
   /** Minutes from the dealer's decision to the last pickup that still delivers every car by
@@ -316,7 +336,7 @@ class Desk {
         const pairs = this.pairsWith(request, option)
         const trust = 1 + this.tune.trust * (this.dealerTrust.get(request.dealerId) ?? 0)
         const laneKey = this.laneOf(request, option.kind)
-        const lane = this.lane.get(laneKey) ?? 1
+        const lane = (this.lane.get(laneKey) ?? 1) * this.laneFactor(request, option.kind)
         const price = Math.round((option.listPriceCents * this.markup * slow * trust * lane * (pairs ? this.tune.pairPrice : 1)) / 100) * 100
         const cost = pairs ? request.referenceFeeCents * this.tune.open * this.tune.pairOpen * 1.2 : fee
         if (price - cost >= this.tune.minMargin * price) {
@@ -377,6 +397,20 @@ class Desk {
     // The world refused the pair gig: both orders go back to gigs of their own.
     await this.post(other, undelivered(other))
     return false
+  }
+
+  /** The fee table's factor for a car from `pickup` to `delivery`. */
+  feeFactor(pickup: string, delivery: string): number {
+    if (!FEES || this.tune.feeTable === 0) return 1
+    return clamp(Math.exp(this.tune.feeTable * ((FEES.pickup[pickup] ?? 0) + (FEES.delivery[delivery] ?? 0))), 0.85, 1.3)
+  }
+
+  /** The lane table's price factor for an option: pickup place x delivery place x option. */
+  laneFactor(request: PriceRequest, kind: string): number {
+    if (!LANES || this.tune.laneTable === 0) return 1
+    const leg = request.legs[0]!
+    const v = (LANES.pickup[leg.pickup.placeId] ?? 0) + (LANES.delivery[leg.delivery.placeId] ?? 0) + this.tune.laneOption * (LANES.option[kind] ?? 0)
+    return clamp(Math.exp(this.tune.laneTable * v), 0.75, 1.4)
   }
 
   /** The price category of an option: how many drivers live near the delivery (the competitor
@@ -582,7 +616,8 @@ class Desk {
    * price share; steep ones may go above the price, because a late car costs a refund, trust and rank. */
   feesFor(order: Order, cars: number): FeeStep[] {
     const share = cars / order.legs.length
-    const fee = this.requests.get(order.id)!.referenceFeeCents * share
+    const leg0 = order.legs[0]!
+    const fee = this.requests.get(order.id)!.referenceFeeCents * share * this.feeFactor(leg0.pickup.placeId, leg0.delivery.placeId)
     const price = order.priceCents * share
     if (this.level < 7) return this.urgent.has(order.id) ? steep(this.now, fee, this.level) : rising(this.now, fee, this.level)
     const urgent = this.urgent.has(order.id)
@@ -813,12 +848,12 @@ async function playPractice(world: World, level: number, tune: Tune, quiet = fal
 
 /** Rebuilds the books, then answers events as they come. After a second without an event,
  * it reads the clock. */
-async function playFinal(world: World): Promise<void> {
+async function playFinal(world: World, tune: Tune): Promise<void> {
   const history = await world.events()
   const snapshot = await world.snapshot()
   if (snapshot.now >= snapshot.endsAt) return
   const level = (await world.client.worlds()).find((summary) => summary.worldId === world.id)?.level ?? 8
-  const desk = new Desk(world, level, snapshot.now, await loadMarket(world.client, world), defaultTune(level))
+  const desk = new Desk(world, level, snapshot.now, await loadMarket(world.client, world), tune)
   await desk.rejoin(snapshot, history)
   await desk.send()
   for await (const event of world.stream({ after: history.at(-1)?.seq ?? -1, idleMs: 1000 })) {
@@ -870,7 +905,16 @@ async function sweep(client: Client, level: Level, seeds: string[], tune: Tune):
   process.once("SIGINT", () => void Promise.all(worlds.map((w) => w.delete().catch(() => {}))).then(() => exit("Stopped. Worlds deleted.")))
   const scores = await Promise.all(
     seeds.map(async (seed) => {
-      const world = await client.create(level, { seed })
+      // All 8 practice slots can be busy (other systems on the same key): wait for one, up to 20 minutes.
+      let world: World | undefined
+      for (let tries = 0; !world; tries++) {
+        try {
+          world = await client.create(level, { seed })
+        } catch (error) {
+          if (!(error instanceof SpreadError) || error.status !== 409 || tries > 240) throw error
+          await new Promise((done) => setTimeout(done, 5000))
+        }
+      }
       let stats = ""
       worlds.push(world)
       try {
@@ -916,6 +960,9 @@ async function main(): Promise<void> {
       "step-min": { type: "string" },
       chain: { type: "string" },
       "lane-step": { type: "string" },
+      "lane-table": { type: "string" },
+      "fee-table": { type: "string" },
+      "lane-option": { type: "string" },
       "chain-reach": { type: "string" },
       "trade-ins": { type: "string" },
       privates: { type: "string" },
@@ -945,6 +992,9 @@ async function main(): Promise<void> {
     stepMin: num(args["step-min"], base.stepMin),
     chain: num(args.chain, base.chain),
     laneStep: num(args["lane-step"], base.laneStep),
+    laneTable: num(args["lane-table"], base.laneTable),
+    feeTable: num(args["fee-table"], base.feeTable),
+    laneOption: num(args["lane-option"], base.laneOption),
     chainReach: num(args["chain-reach"], base.chainReach),
     tradeIns: args["trade-ins"] === undefined ? base.tradeIns : args["trade-ins"] === "yes",
     privates: args.privates === undefined ? base.privates : args.privates === "yes",
@@ -975,7 +1025,7 @@ async function main(): Promise<void> {
           world = await nextFinal(client)
           console.log(`Final world ${world.id}.`)
         }
-        await playFinal(world)
+        await playFinal(world, tune)
         score = await world.score()
         break
       } catch (error) {
